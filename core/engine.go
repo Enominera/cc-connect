@@ -2862,7 +2862,7 @@ func dumpGoroutineStacks(path string) {
 		defer close(done)
 		buf := make([]byte, 1<<22)
 		n := runtime.Stack(buf, true)
-		if err := os.WriteFile(path, buf[:n], 0644); err != nil {
+		if err := os.WriteFile(path, buf[:n], 0o0600); err != nil {
 			slog.Warn("busy lock: failed to write goroutine stack dump", "path", path, "error", err)
 		}
 	}()
@@ -2870,6 +2870,78 @@ func dumpGoroutineStacks(path string) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		slog.Warn("busy lock: goroutine stack dump timed out; continuing recovery")
+	}
+}
+
+// staleLockDumpKeep is how many busy-stale-*.txt goroutine dumps are retained
+// in the dump dir; older ones are pruned on each new dump.
+const staleLockDumpKeep = 5
+
+// staleLockDumpDir returns the private directory stale-lock goroutine dumps
+// are written to (0700 under the OS temp dir). Goroutine stacks can embed
+// message text, so dumps must not be world-readable in a shared /tmp, and the
+// private dir narrows (not fully defeats — MkdirAll does not verify ownership
+// of a pre-existing directory; an ownership check is follow-up material)
+// symlink planting under predictable filenames. For a single cc-connect
+// instance prune sees only its own files; if several instances of the same
+// user share the host, they share this dir and the 5-dump retention becomes
+// a global cap — still bounded, just not per-process.
+func staleLockDumpDir() (string, error) {
+	dir := filepath.Join(os.TempDir(), "busy-stale-dumps")
+	if err := os.MkdirAll(dir, 0o0700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// staleLockDumpName renders a dump filename. The zero-padded fixed-width
+// 13-digit timestamp prefix makes lexicographic order chronological across
+// sessions (modulo local clock skew), regardless of session key.
+func staleLockDumpName(ts int64, sessionKey string) string {
+	return fmt.Sprintf("busy-stale-%013d-%s.txt", ts, sanitizeFileToken(sessionKey))
+}
+
+// dumpStaleLockStacks writes the goroutine dump for a stale-lock self-heal
+// event into staleLockDumpDir() — never the process working directory, which
+// may be a source checkout or the data dir — and prunes old dumps. The write
+// itself is async and best-effort: a hard daemon exit before it completes
+// loses that dump, which is acceptable (recovery never depends on it).
+func dumpStaleLockStacks(sessionKey string) {
+	dir, err := staleLockDumpDir()
+	if err != nil {
+		slog.Debug("busy lock: cannot create dump dir", "error", err)
+		return
+	}
+	dumpGoroutineStacks(filepath.Join(dir, staleLockDumpName(time.Now().Unix(), sessionKey)))
+	pruneStaleLockDumps(dir, staleLockDumpKeep)
+}
+
+// pruneStaleLockDumps removes the oldest busy-stale-*.txt dumps beyond keep.
+// Best-effort and lock-free: two prunes racing to remove the same file is
+// fine (IsNotExist ignored), and a dump written after this prune's ReadDir
+// simply survives one extra cycle. Failures only log at debug level —
+// retention is housekeeping, never a recovery blocker.
+func pruneStaleLockDumps(dir string, keep int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Debug("busy lock: prune readdir failed", "dir", dir, "error", err)
+		return
+	}
+	var dumps []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "busy-stale-") || !strings.HasSuffix(e.Name(), ".txt") {
+			continue
+		}
+		dumps = append(dumps, e)
+	}
+	if len(dumps) <= keep {
+		return
+	}
+	sort.Slice(dumps, func(i, j int) bool { return dumps[i].Name() < dumps[j].Name() })
+	for _, e := range dumps[:len(dumps)-keep] {
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
+			slog.Debug("busy lock: failed to prune stale stack dump", "file", e.Name(), "error", err)
+		}
 	}
 }
 
@@ -3135,14 +3207,15 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		// lock). Break it and process this message in a fresh turn instead of
 		// queueing into a session nobody will ever drain. Live agents never
 		// hit this (Alive() gate); the held-threshold keeps us clear of
-		// graceful-stop waits. Lock order: interactiveMu → session.mu, never
-		// reversed.
+		// graceful-stop waits. An agent that is hung but still PID-alive also
+		// falls through to normal queueing by design — breaking a live
+		// process's lock is out of scope for this path. Lock order:
+		// interactiveMu → session.mu, never reversed.
 		e.interactiveMu.Lock()
 		st, hasSt := e.interactiveStates[interactiveKey]
 		agentAlive := hasSt && st != nil && st.agentSession != nil && st.agentSession.Alive()
 		e.interactiveMu.Unlock()
 		if !agentAlive && e.staleLockBreakAfter > 0 {
-			dumpGoroutineStacks(fmt.Sprintf("busy-stale-%s-%d.txt", sanitizeFileToken(msg.SessionKey), time.Now().Unix()))
 			if since, broken := session.BreakStaleLock(e.staleLockBreakAfter); broken {
 				heldFor := time.Since(since).Round(time.Second)
 				slog.Warn("busy-stale-lock: agent process dead but lock held; broken (self-heal)",
@@ -3151,6 +3224,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 					"held_for", heldFor,
 				)
 				e.reply(p, msg.ReplyCtx, fmt.Sprintf("⚠️ 会话卡锁已自动恢复（进程已退出但锁未释放，挂了 %s），本条消息继续处理。", heldFor))
+				// Dump only when a break actually fired: a message arriving
+				// while the lock is busy-but-not-yet-breakable must not churn
+				// megabyte dumps, and only the goroutine that won the break
+				// writes one (same-second filename collisions are impossible).
+				dumpStaleLockStacks(msg.SessionKey)
 				if g, ok := session.TryLock(); ok {
 					lockGen = g
 					goto sessionLocked
