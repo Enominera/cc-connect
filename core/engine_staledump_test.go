@@ -18,7 +18,7 @@ func TestStaleLockDumpNamePadding(t *testing.T) {
 	if older != wantOlder {
 		t.Fatalf("got %q, want %q", older, wantOlder)
 	}
-	if !(older < newer) {
+	if older >= newer {
 		t.Fatalf("padded names must sort chronologically: %q vs %q", older, newer)
 	}
 	if !strings.HasPrefix(newer, "busy-stale-0001000000000-") {
